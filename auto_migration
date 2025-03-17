@@ -1,85 +1,72 @@
 import os
-import sys
-from io import StringIO
-from contextlib import redirect_stdout
 from sqlalchemy import inspect
+from sqlalchemy.orm import Session
 from alembic.config import Config
 from alembic import command
 from alembic.script import ScriptDirectory
+from alembic.migration import MigrationContext
+from alembic.autogenerate import compare_metadata
 
-from your_dynamic_model import base, get_engine  # Replace with actual imports
+# Import your SQLAlchemy Base and engine
+from your_dynamic_model import base, get_engine
 
 ALEMBIC_INI_PATH = os.path.join(os.path.dirname(__file__), "alembic.ini")
 
 def stamp_db_if_not_stamped(alembic_cfg, engine):
     """
-    If the 'alembic_version' table doesn't exist, Alembic has never run on this DB.
-    We'll stamp the DB at 'head' to mark the current schema as baseline.
+    If 'alembic_version' doesn't exist, stamp current DB schema as baseline 
+    so Alembic won't try to recreate existing tables.
     """
     inspector = inspect(engine)
     if "alembic_version" not in inspector.get_table_names():
-        print("📌 Alembic version table not found; stamping existing DB at 'head' as baseline.")
+        print("📌 No 'alembic_version' table found. Stamping existing DB at 'head' as baseline.")
         command.stamp(alembic_cfg, "head")
     else:
-        print("✅ Alembic version table found; DB is already under Alembic control.")
+        print("✅ Alembic is already tracking this DB.")
 
-def get_latest_revision(alembic_cfg):
+def get_current_heads(alembic_cfg):
     """
-    Returns the most recent revision in the alembic/versions directory.
+    Returns a set of currently applied DB revisions from Alembic, or empty if none.
     """
-    script = ScriptDirectory.from_config(alembic_cfg)
-    heads = script.get_heads()
-    if not heads:
-        return None
-    # Usually there's a single head unless you have branching
-    return heads[0]
+    current = command.current(alembic_cfg, verbose=False)
+    if current is None:
+        return set()
+    if isinstance(current, list):
+        # Alembic >= 1.7 may return a list
+        return set([rev for rev in current if rev])
+    # else it's a string, possibly multiple revs
+    return set(r.strip() for r in current.split(",") if r.strip())
+
+def get_latest_heads(alembic_cfg):
+    """
+    Returns the set of head revisions from the script directory 
+    (usually only one unless there's a merge).
+    """
+    script_dir = ScriptDirectory.from_config(alembic_cfg)
+    return set(script_dir.get_heads())
 
 def is_db_uptodate(alembic_cfg):
     """
-    Checks if the DB is at Alembic's head revision.
-    Returns True if up to date, False otherwise.
+    Check if the DB is at the most recent head(s).
     """
-    script = ScriptDirectory.from_config(alembic_cfg)
-    head_revision = script.get_heads()
-    current_revs = command.current(alembic_cfg, verbose=False)
-    # `command.current` might return a string like 'head' or revision IDs.
-    # We'll parse and compare them. If there's a mismatch, DB not up-to-date.
-    if isinstance(current_revs, list):
-        db_revs = [rev for rev in current_revs if rev is not None]
-    elif isinstance(current_revs, str):
-        db_revs = [r.strip() for r in current_revs.split(",") if r.strip()]
-    else:
-        db_revs = []
+    current_heads = get_current_heads(alembic_cfg)
+    latest_heads = get_latest_heads(alembic_cfg)
+    return current_heads == latest_heads
 
-    head_revs = [r for r in head_revision if r is not None]
-
-    # If DB is at any of the heads, we consider it up to date.
-    return set(db_revs) == set(head_revs)
-
-def detect_model_changes(alembic_cfg):
+def detect_model_changes(engine):
     """
-    Runs an autogenerate in 'sql' mode (no file output) to see if changes exist.
-    Returns True if changes are detected, False if not.
+    Use an in-memory Alembic 'MigrationContext' + 'compare_metadata'
+    to detect if the DB schema differs from the SQLAlchemy models (base.metadata).
+    Returns True if differences exist, otherwise False.
     """
-    buf = StringIO()
-    with redirect_stdout(buf):
-        # We use `sql=True` so Alembic just prints the SQL changes instead of writing a new file
-        try:
-            command.revision(alembic_cfg, message="Check model diff", autogenerate=True, sql=True)
-        except SystemExit:
-            # Alembic sometimes calls sys.exit() after revision creation, so we catch it
-            pass
-
-    output = buf.getvalue()
-    # Alembic will output "Generating SQL script from branches" and the difference in DDL
-    # If there's no difference, it typically says "No changes detected" or "empty message".
-    # We'll do a simple check:
-    if "CREATE TABLE" in output or "ALTER TABLE" in output or "DROP TABLE" in output:
-        return True
-    if "empty migration" in output.lower() or "no changes" in output.lower():
-        return False
-    # if uncertain, let's be safe and treat it as True
-    return True
+    conn = engine.connect()
+    try:
+        # Configure a MigrationContext for the current DB
+        migration_ctx = MigrationContext.configure(conn)
+        db_diffs = compare_metadata(migration_ctx, base.metadata)
+        return bool(db_diffs)  # True if there's at least one difference
+    finally:
+        conn.close()
 
 def run_auto_migration():
     engine = get_engine()
@@ -88,28 +75,26 @@ def run_auto_migration():
     alembic_cfg = Config(ALEMBIC_INI_PATH)
     alembic_cfg.set_main_option("sqlalchemy.url", str(engine.url))
 
-    # Step 1: If Alembic is uninitialized on this DB, stamp current schema as baseline
+    # Step 1: Stamp if needed (bring existing DB under Alembic)
     stamp_db_if_not_stamped(alembic_cfg, engine)
 
-    # Step 2: Ensure DB is at the current head (if any exist)
-    # This prevents "target database is not up to date" error if prior migrations are un-applied
-    latest_rev = get_latest_revision(alembic_cfg)
-    if latest_rev:
-        # If there's at least one migration file in versions, upgrade to that first
+    # Step 2: Ensure DB is at current head if there are existing migrations
+    if get_latest_heads(alembic_cfg):
+        # If any migrations exist in versions folder, ensure DB is up to date
         if not is_db_uptodate(alembic_cfg):
-            print("🔄 Upgrading DB to the latest known revision before generating new migrations...")
+            print("🔄 Database not at latest revision; upgrading to head...")
             command.upgrade(alembic_cfg, "head")
 
-    # Step 3: Detect if there are new model changes
-    if detect_model_changes(alembic_cfg):
-        # We have changes, so let's generate and apply a new revision
-        print("🔧 Model changes detected; generating a new migration...")
+    # Step 3: Check if the models differ from the DB
+    if detect_model_changes(engine):
+        print("🔧 Model changes detected; creating new migration...")
+        # Autogenerate and create a new revision script
         command.revision(alembic_cfg, autogenerate=True, message="Auto migration")
         print("🚀 Applying the new migration...")
         command.upgrade(alembic_cfg, "head")
-        print("✅ Database schema is now up-to-date.")
+        print("✅ Database schema is now up-to-date with model changes.")
     else:
-        print("✅ No new model changes detected. Database is already up-to-date.")
+        print("✅ No schema changes detected. DB is already up-to-date.")
 
 if __name__ == "__main__":
     run_auto_migration()
